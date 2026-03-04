@@ -362,6 +362,10 @@ app.get("/api/payments/status/:externalId", async (req, res) => {
 // 4. Debug endpoint (Remove in production)
 app.get("/api/debug/config", async (req, res) => {
   try {
+    const { data: settings, error: sbError } = await supabase
+      .from('settings')
+      .select('key, value');
+
     const config = await getSopayConfig();
     res.json({
       source: config.source,
@@ -370,6 +374,10 @@ app.get("/api/debug/config", async (req, res) => {
       clientIdLength: config.clientId?.length || 0,
       hasClientSecret: !!config.clientSecret,
       clientSecretLength: config.clientSecret?.length || 0,
+      supabaseError: sbError ? {
+        message: sbError.message,
+        code: sbError.code
+      } : null,
       supabaseUrl: supabaseUrl,
       hasServiceRoleKey: !!supabaseServiceRoleKey,
       serviceRoleKeyLength: supabaseServiceRoleKey.length
