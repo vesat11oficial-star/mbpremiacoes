@@ -18,14 +18,17 @@ const supabaseUrl = process.env.SUPABASE_URL || "https://zbaaopdndnlckuornird.su
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
-const SOPAY_API_URL = process.env.SOPAY_API_URL || "https://api.sopaybr.com/api";
+const SOPAY_BASE_URL = (process.env.SOPAY_API_URL || "https://api.sopaybr.com").replace(/\/$/, "");
 const SOPAY_CLIENT_ID = process.env.SOPAY_CLIENT_ID;
 const SOPAY_CLIENT_SECRET = process.env.SOPAY_CLIENT_SECRET;
 
 // Helper to get Sopay JWT Token
 async function getSopayToken() {
   try {
-    const response = await fetch(`${SOPAY_API_URL}/auth/login`, {
+    const authUrl = `${SOPAY_BASE_URL}/api/auth/login`;
+    console.log(`Attempting Sopay Auth at: ${authUrl}`);
+
+    const response = await fetch(authUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -35,15 +38,20 @@ async function getSopayToken() {
     });
 
     if (!response.ok) {
-      const errorData = await response.json();
-      console.error("Sopay Auth Error:", errorData);
-      throw new Error("Failed to authenticate with Sopay");
+      const errorData = await response.json().catch(() => ({ message: "Non-JSON response" }));
+      console.error("Sopay Auth Error Details:", {
+        status: response.status,
+        statusText: response.statusText,
+        data: errorData,
+        url: authUrl
+      });
+      throw new Error(`Failed to authenticate with Sopay: ${response.status} ${response.statusText}`);
     }
 
     const data = (await response.json()) as { token: string };
     return data.token;
   } catch (error) {
-    console.error("getSopayToken error:", error);
+    console.error("getSopayToken exception:", error);
     throw error;
   }
 }
@@ -81,8 +89,9 @@ app.post("/api/payments/create", async (req, res) => {
     }
 
     const callbackUrl = `${process.env.APP_URL}/api/sopay-callback`;
+    const depositUrl = `${SOPAY_BASE_URL}/api/payments/deposit`;
 
-    const sopayResponse = await fetch(`${SOPAY_API_URL}/payments/deposit`, {
+    const sopayResponse = await fetch(depositUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -101,9 +110,14 @@ app.post("/api/payments/create", async (req, res) => {
     });
 
     if (!sopayResponse.ok) {
-      const errorData = await sopayResponse.json();
-      console.error("Sopay Deposit Error:", errorData);
-      return res.status(500).json({ error: "Failed to create Sopay deposit" });
+      const errorData = await sopayResponse.json().catch(() => ({ message: "Non-JSON response" }));
+      console.error("Sopay Deposit Error Details:", {
+        status: sopayResponse.status,
+        statusText: sopayResponse.statusText,
+        data: errorData,
+        url: depositUrl
+      });
+      return res.status(500).json({ error: "Failed to create Sopay deposit", details: errorData });
     }
 
     const sopayData = (await sopayResponse.json()) as {
