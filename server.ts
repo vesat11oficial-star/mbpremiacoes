@@ -24,9 +24,14 @@ const SOPAY_CLIENT_SECRET = process.env.SOPAY_CLIENT_SECRET;
 
 // Helper to get Sopay JWT Token
 async function getSopayToken() {
+  if (!SOPAY_CLIENT_ID || !SOPAY_CLIENT_SECRET) {
+    console.error("CRITICAL: SOPAY_CLIENT_ID or SOPAY_CLIENT_SECRET is not defined in environment variables.");
+    throw new Error("Sopay credentials missing. Please configure SOPAY_CLIENT_ID and SOPAY_CLIENT_SECRET.");
+  }
+
   try {
     const authUrl = `${SOPAY_BASE_URL}/api/auth/login`;
-    console.log(`Attempting Sopay Auth at: ${authUrl}`);
+    console.log(`Attempting Sopay Auth at: ${authUrl} with Client ID: ${SOPAY_CLIENT_ID.substring(0, 4)}...`);
 
     const response = await fetch(authUrl, {
       method: "POST",
@@ -45,6 +50,11 @@ async function getSopayToken() {
         data: errorData,
         url: authUrl
       });
+      
+      if (response.status === 401) {
+        throw new Error("Sopay Authentication Failed: Invalid Client ID or Client Secret. Check your credentials.");
+      }
+      
       throw new Error(`Failed to authenticate with Sopay: ${response.status} ${response.statusText}`);
     }
 
@@ -117,7 +127,12 @@ app.post("/api/payments/create", async (req, res) => {
         data: errorData,
         url: depositUrl
       });
-      return res.status(500).json({ error: "Failed to create Sopay deposit", details: errorData });
+      
+      const errorMessage = errorData.message || "Falha ao criar depósito na Sopay";
+      return res.status(sopayResponse.status).json({ 
+        error: errorMessage,
+        code: "SOPAY_DEPOSIT_ERROR"
+      });
     }
 
     const sopayData = (await sopayResponse.json()) as {
@@ -138,9 +153,13 @@ app.post("/api/payments/create", async (req, res) => {
       pix_qrcode: sopayData.pix_qrcode,
       pix_payload: sopayData.pix_payload,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error("Create Payment Error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    const status = error.message?.includes("Authentication Failed") ? 401 : 500;
+    res.status(status).json({ 
+      error: error.message || "Internal server error",
+      code: status === 401 ? "AUTH_FAILED" : "SERVER_ERROR"
+    });
   }
 });
 
@@ -162,15 +181,22 @@ app.post("/api/sopay-callback", async (req, res) => {
     ]);
 
     if (status === "COMPLETED") {
-      // Find the payment
-      const { data: payment, error: findError } = await supabase
-        .from("payments")
-        .select("*")
-        .eq("external_id", external_id)
-        .single();
+      // Find the payment - try external_id first, then transaction_id
+      let query = supabase.from("payments").select("*");
+      
+      if (external_id) {
+        query = query.eq("external_id", external_id);
+      } else if (transaction_id) {
+        query = query.eq("transaction_id", transaction_id);
+      } else {
+        console.error("Webhook received without external_id or transaction_id");
+        return res.status(400).json({ error: "Missing identifiers" });
+      }
+
+      const { data: payment, error: findError } = await query.single();
 
       if (findError || !payment) {
-        console.error("Payment not found for webhook:", external_id);
+        console.error("Payment not found for webhook:", { external_id, transaction_id });
         return res.status(404).json({ error: "Payment not found" });
       }
 
@@ -214,6 +240,60 @@ app.post("/api/sopay-callback", async (req, res) => {
     res.json({ status: "received" });
   } catch (error) {
     console.error("Webhook Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// 3. Endpoint to check payment status (Polling fallback)
+app.get("/api/payments/status/:externalId", async (req, res) => {
+  try {
+    const { externalId } = req.params;
+
+    // Get payment from our DB
+    const { data: payment, error: dbError } = await supabase
+      .from("payments")
+      .select("*")
+      .eq("external_id", externalId)
+      .single();
+
+    if (dbError || !payment) {
+      return res.status(404).json({ error: "Payment not found" });
+    }
+
+    // If already completed in our DB, return it
+    if (payment.status === "COMPLETED") {
+      return res.json({ status: "COMPLETED" });
+    }
+
+    // Otherwise, check with Sopay directly if we have a transaction_id
+    if (payment.transaction_id) {
+      const token = await getSopayToken();
+      const statusUrl = `${SOPAY_BASE_URL}/api/transactions/getStatusTransac/${payment.transaction_id}`;
+      
+      const sopayResponse = await fetch(statusUrl, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (sopayResponse.ok) {
+        const { status } = (await sopayResponse.json()) as { status: string };
+        
+        // If Sopay says it's completed but our DB doesn't know yet (webhook lag)
+        if (status === "COMPLETED") {
+          // We could trigger the release logic here too for extra safety
+          // But for polling, just returning the status is usually enough if the webhook is expected to handle the DB update
+          return res.json({ status: "COMPLETED" });
+        }
+        
+        return res.json({ status });
+      }
+    }
+
+    res.json({ status: payment.status });
+  } catch (error) {
+    console.error("Check Status Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });

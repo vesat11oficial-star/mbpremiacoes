@@ -37,8 +37,24 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({ raffle, quantity, 
       }
     });
 
+    // Polling fallback every 10 seconds
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/payments/status/${pixData.external_id}`);
+        if (response.ok) {
+          const { status } = await response.json();
+          if (status === 'COMPLETED') {
+            handleConfirmPayment();
+          }
+        }
+      } catch (err) {
+        console.error("Polling error:", err);
+      }
+    }, 10000);
+
     return () => {
       raffleService.unsubscribeFromPayment(channel);
+      clearInterval(pollInterval);
     };
   }, [pixData?.external_id]);
 
@@ -105,11 +121,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({ raffle, quantity, 
         })
       });
 
+      const data = await response.json();
+
       if (!response.ok) {
-        throw new Error('Falha ao gerar PIX. Tente novamente.');
+        if (response.status === 401) {
+          throw new Error('Erro de Configuração: As credenciais da Sopay (Client ID/Secret) estão incorretas ou não foram configuradas no servidor.');
+        }
+        throw new Error(data.error || 'Falha ao gerar PIX. Tente novamente.');
       }
 
-      const data = await response.json();
       setPixData({
         qrcode: data.pix_qrcode,
         payload: data.pix_payload,
