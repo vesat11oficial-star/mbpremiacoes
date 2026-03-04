@@ -18,27 +18,88 @@ const supabaseUrl = process.env.SUPABASE_URL || "https://zbaaopdndnlckuornird.su
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
 
-const SOPAY_BASE_URL = (process.env.SOPAY_API_URL || "https://api.sopaybr.com").replace(/\/$/, "");
-const SOPAY_CLIENT_ID = process.env.SOPAY_CLIENT_ID;
-const SOPAY_CLIENT_SECRET = process.env.SOPAY_CLIENT_SECRET;
+// Helper to build Sopay URLs correctly
+async function getSopayConfig() {
+  try {
+    const { data: settings, error } = await supabase
+      .from('settings')
+      .select('key, value');
+
+    if (error) {
+      console.error("Supabase Query Error (settings table):", {
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint
+      });
+      return {
+        baseUrl: (process.env.SOPAY_API_URL || "https://api.sopaybr.com").replace(/\/$/, ""),
+        clientId: process.env.SOPAY_CLIENT_ID?.trim(),
+        clientSecret: process.env.SOPAY_CLIENT_SECRET?.trim(),
+        source: 'env_fallback'
+      };
+    }
+
+    if (!settings || settings.length === 0) {
+      console.warn("Settings table is empty, falling back to ENV.");
+      return {
+        baseUrl: (process.env.SOPAY_API_URL || "https://api.sopaybr.com").replace(/\/$/, ""),
+        clientId: process.env.SOPAY_CLIENT_ID?.trim(),
+        clientSecret: process.env.SOPAY_CLIENT_SECRET?.trim(),
+        source: 'env_fallback_empty_table'
+      };
+    }
+
+    const config: Record<string, string> = {};
+    settings.forEach(s => {
+      config[s.key] = s.value.trim();
+    });
+
+    return {
+      baseUrl: (config['SOPAY_API_URL'] || process.env.SOPAY_API_URL || "https://api.sopaybr.com").replace(/\/$/, ""),
+      clientId: config['SOPAY_CLIENT_ID'] || process.env.SOPAY_CLIENT_ID?.trim(),
+      clientSecret: config['SOPAY_CLIENT_SECRET'] || process.env.SOPAY_CLIENT_SECRET?.trim(),
+      source: 'supabase'
+    };
+  } catch (err) {
+    console.error("Unexpected error in getSopayConfig:", err);
+    return {
+      baseUrl: (process.env.SOPAY_API_URL || "https://api.sopaybr.com").replace(/\/$/, ""),
+      clientId: process.env.SOPAY_CLIENT_ID?.trim(),
+      clientSecret: process.env.SOPAY_CLIENT_SECRET?.trim(),
+      source: 'error_fallback'
+    };
+  }
+}
+
+function buildSopayUrl(baseUrl: string, path: string) {
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  if (baseUrl.endsWith("/api") && cleanPath.startsWith("/api/")) {
+    return `${baseUrl}${cleanPath.substring(4)}`;
+  }
+  return `${baseUrl}${cleanPath}`;
+}
 
 // Helper to get Sopay JWT Token
 async function getSopayToken() {
-  if (!SOPAY_CLIENT_ID || !SOPAY_CLIENT_SECRET) {
-    console.error("CRITICAL: SOPAY_CLIENT_ID or SOPAY_CLIENT_SECRET is not defined in environment variables.");
-    throw new Error("Sopay credentials missing. Please configure SOPAY_CLIENT_ID and SOPAY_CLIENT_SECRET.");
+  const { baseUrl, clientId, clientSecret } = await getSopayConfig();
+
+  if (!clientId || !clientSecret) {
+    console.error("CRITICAL: Sopay credentials missing in both Supabase and Environment.");
+    throw new Error("Sopay Authentication Failed: Credentials not configured.");
   }
 
   try {
-    const authUrl = `${SOPAY_BASE_URL}/api/auth/login`;
-    console.log(`Attempting Sopay Auth at: ${authUrl} with Client ID: ${SOPAY_CLIENT_ID.substring(0, 4)}...`);
+    const authUrl = buildSopayUrl(baseUrl, "/api/auth/login");
+    console.log(`Attempting Sopay Auth at: ${authUrl}`);
+    console.log(`Credential lengths - ID: ${clientId.length}, Secret: ${clientSecret.length}`);
 
     const response = await fetch(authUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        client_id: SOPAY_CLIENT_ID,
-        client_secret: SOPAY_CLIENT_SECRET,
+        client_id: clientId,
+        client_secret: clientSecret,
       }),
     });
 
@@ -52,14 +113,14 @@ async function getSopayToken() {
       });
       
       if (response.status === 401) {
-        throw new Error("Sopay Authentication Failed: Invalid Client ID or Client Secret. Check your credentials.");
+        throw new Error("Sopay Authentication Failed: Invalid Client ID or Client Secret. Check your credentials in Supabase settings table.");
       }
       
       throw new Error(`Failed to authenticate with Sopay: ${response.status} ${response.statusText}`);
     }
 
     const data = (await response.json()) as { token: string };
-    return data.token;
+    return { token: data.token, baseUrl };
   } catch (error) {
     console.error("getSopayToken exception:", error);
     throw error;
@@ -75,7 +136,7 @@ app.post("/api/payments/create", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    const token = await getSopayToken();
+    const { token, baseUrl } = await getSopayToken();
     const externalId = `pay_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
     // Create payment record in Supabase first (status: PENDING)
@@ -99,7 +160,7 @@ app.post("/api/payments/create", async (req, res) => {
     }
 
     const callbackUrl = `${process.env.APP_URL}/api/sopay-callback`;
-    const depositUrl = `${SOPAY_BASE_URL}/api/payments/deposit`;
+    const depositUrl = buildSopayUrl(baseUrl, "/api/payments/deposit");
 
     const sopayResponse = await fetch(depositUrl, {
       method: "POST",
@@ -267,8 +328,8 @@ app.get("/api/payments/status/:externalId", async (req, res) => {
 
     // Otherwise, check with Sopay directly if we have a transaction_id
     if (payment.transaction_id) {
-      const token = await getSopayToken();
-      const statusUrl = `${SOPAY_BASE_URL}/api/transactions/getStatusTransac/${payment.transaction_id}`;
+      const { token, baseUrl } = await getSopayToken();
+      const statusUrl = buildSopayUrl(baseUrl, `/api/transactions/getStatusTransac/${payment.transaction_id}`);
       
       const sopayResponse = await fetch(statusUrl, {
         method: "GET",
@@ -295,6 +356,26 @@ app.get("/api/payments/status/:externalId", async (req, res) => {
   } catch (error) {
     console.error("Check Status Error:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// 4. Debug endpoint (Remove in production)
+app.get("/api/debug/config", async (req, res) => {
+  try {
+    const config = await getSopayConfig();
+    res.json({
+      source: config.source,
+      baseUrl: config.baseUrl,
+      hasClientId: !!config.clientId,
+      clientIdLength: config.clientId?.length || 0,
+      hasClientSecret: !!config.clientSecret,
+      clientSecretLength: config.clientSecret?.length || 0,
+      supabaseUrl: supabaseUrl,
+      hasServiceRoleKey: !!supabaseServiceRoleKey,
+      serviceRoleKeyLength: supabaseServiceRoleKey.length
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
   }
 });
 
